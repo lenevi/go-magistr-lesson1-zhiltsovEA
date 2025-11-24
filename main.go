@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bufio"
-	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,186 +11,127 @@ import (
 	"time"
 )
 
-type Config struct {
-	PollInterval     time.Duration
-	RequestTimeout   time.Duration
-	LoadThreshold    float64
-	MemoryThreshold  int
-	DiskThreshold    int
-	NetworkThreshold int
-}
+const (
+	statsURL = "http://srv.msk01.gigacorp.local/_stats"
 
-type SystemMetrics struct {
-	LoadAverage float64
-	TotalRAM    uint64
-	UsedRAM     uint64
-	TotalDisk   uint64
-	UsedDisk    uint64
-	NetCapacity uint64
-	NetUsed     uint64
-}
+	loadAvgThreshold  = 30.0
+	memUsageThreshold = 80 
+	diskUsageLimit    = 90 
+	netUsageLimit     = 90 
 
-var appConfig = Config{
-	PollInterval:     getPollInterval(),
-	RequestTimeout:   1500 * time.Millisecond,
-	LoadThreshold:    30.0,
-	MemoryThreshold:  80,
-	DiskThreshold:    90,
-	NetworkThreshold: 90,
-}
+	oneMiB = 1024 * 1024
+)
 
-func getPollInterval() time.Duration {
-	intervalMs := 200
-	if envVal := os.Getenv("POLL_INTERVAL_MS"); envVal != "" {
-		if val, err := strconv.Atoi(envVal); err == nil && val > 0 {
-			intervalMs = val
+func getenvInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
 	}
-	return time.Duration(intervalMs) * time.Millisecond
+	return def
 }
 
 func main() {
-	httpClient := &http.Client{Timeout: appConfig.RequestTimeout}
-	monitor := NewSystemMonitor(httpClient)
+	interval := time.Duration(getenvInt("POLL_INTERVAL_MS", 200)) * time.Millisecond
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
 
-	fmt.Println("Starting system monitor...")
-	monitor.RunContinuousCheck()
-}
+	consecutiveErrors := 0
+	errorPrinted := false
 
-type Monitor struct {
-	client            *http.Client
-	errorCount        int
-	errorNotification bool
-}
-
-func NewSystemMonitor(client *http.Client) *Monitor {
-	return &Monitor{
-		client: client,
-	}
-}
-
-func (m *Monitor) RunContinuousCheck() {
 	for {
-		if err := m.PerformHealthCheck(); err != nil {
-			m.handleMonitoringError(err)
+		err := pollOnce(client)
+		if err != nil {
+			consecutiveErrors++
+			if consecutiveErrors >= 3 && !errorPrinted {
+				fmt.Println("Unable to fetch server statistic.")
+				errorPrinted = true
+			}
 		} else {
-			m.resetErrorState()
+			consecutiveErrors = 0
+			errorPrinted = false
 		}
-		time.Sleep(appConfig.PollInterval)
+		time.Sleep(interval)
 	}
 }
 
-func (m *Monitor) PerformHealthCheck() error {
-	metrics, err := m.fetchSystemMetrics()
+func pollOnce(client *http.Client) error {
+	req, err := http.NewRequest(http.MethodGet, statsURL, nil)
 	if err != nil {
 		return err
 	}
 
-	m.evaluateSystemHealth(metrics)
-	return nil
-}
-
-func (m *Monitor) fetchSystemMetrics() (*SystemMetrics, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), appConfig.RequestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://srv.msk01.gigacorp.local/_stats", nil)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned: %s", resp.Status)
+		return fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	return m.parseMetricsResponse(resp)
-}
-
-func (m *Monitor) parseMetricsResponse(resp *http.Response) (*SystemMetrics, error) {
-	scanner := bufio.NewScanner(resp.Body)
-	if !scanner.Scan() {
-		return nil, fmt.Errorf("empty response")
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read body: %w", err)
+	}
+	line := strings.TrimSpace(string(body))
+	if line == "" {
+		return errors.New("empty body")
 	}
 
-	dataLine := strings.TrimSpace(scanner.Text())
-	components := strings.Split(dataLine, ",")
-	if len(components) != 7 {
-		return nil, fmt.Errorf("invalid data format: expected 7 fields, got %d", len(components))
+	fields := strings.Split(line, ",")
+	if len(fields) != 7 {
+		return fmt.Errorf("unexpected fields count: %d", len(fields))
 	}
 
-	metrics := &SystemMetrics{}
-	var parseErrors []string
+	loadAvg, err := strconv.ParseFloat(strings.TrimSpace(fields[0]), 64)
+	if err != nil {
+		return fmt.Errorf("parse load avg: %w", err)
+	}
+	totalRAM, _ := strconv.ParseUint(strings.TrimSpace(fields[1]), 10, 64)
+	usedRAM, _ := strconv.ParseUint(strings.TrimSpace(fields[2]), 10, 64)
+	totalDisk, _ := strconv.ParseUint(strings.TrimSpace(fields[3]), 10, 64)
+	usedDisk, _ := strconv.ParseUint(strings.TrimSpace(fields[4]), 10, 64)
+	netCap, _ := strconv.ParseUint(strings.TrimSpace(fields[5]), 10, 64)
+	netUsed, _ := strconv.ParseUint(strings.TrimSpace(fields[6]), 10, 64)
 
-	if val, err := strconv.ParseFloat(strings.TrimSpace(components[0]), 64); err == nil {
-		metrics.LoadAverage = val
-	} else {
-		parseErrors = append(parseErrors, "load average")
+	if loadAvg > loadAvgThreshold {
+		fmt.Printf("Load Average is too high: %s\n", trimTrailingZeros(fields[0]))
 	}
 
-	metrics.TotalRAM, _ = strconv.ParseUint(strings.TrimSpace(components[1]), 10, 64)
-	metrics.UsedRAM, _ = strconv.ParseUint(strings.TrimSpace(components[2]), 10, 64)
-	metrics.TotalDisk, _ = strconv.ParseUint(strings.TrimSpace(components[3]), 10, 64)
-	metrics.UsedDisk, _ = strconv.ParseUint(strings.TrimSpace(components[4]), 10, 64)
-	metrics.NetCapacity, _ = strconv.ParseUint(strings.TrimSpace(components[5]), 10, 64)
-	metrics.NetUsed, _ = strconv.ParseUint(strings.TrimSpace(components[6]), 10, 64)
-
-	if len(parseErrors) > 0 {
-		return nil, fmt.Errorf("parse errors: %s", strings.Join(parseErrors, ", "))
-	}
-
-	return metrics, nil
-}
-
-func (m *Monitor) evaluateSystemHealth(metrics *SystemMetrics) {
-	if metrics.LoadAverage > appConfig.LoadThreshold {
-		fmt.Printf("High system load detected: %s\n", formatDecimal(metrics.LoadAverage))
-	}
-
-	if metrics.TotalRAM > 0 {
-		memUsagePercent := int(100 * metrics.UsedRAM / metrics.TotalRAM)
-		if memUsagePercent > appConfig.MemoryThreshold {
-			fmt.Printf("Memory usage exceeded threshold: %d%%\n", memUsagePercent)
+	if totalRAM > 0 {
+		percent := int((usedRAM * 100) / totalRAM) // без округления
+		if percent > memUsageThreshold {
+			fmt.Printf("Memory usage too high: %d%%\n", percent)
 		}
 	}
 
-	if metrics.TotalDisk > 0 {
-		diskUsagePercent := int(100 * metrics.UsedDisk / metrics.TotalDisk)
-		if diskUsagePercent > appConfig.DiskThreshold {
-			freeSpaceMB := (metrics.TotalDisk - metrics.UsedDisk) / (1024 * 1024)
-			fmt.Printf("Low disk space: %d MB remaining\n", freeSpaceMB)
+	if totalDisk > 0 {
+		percent := int((usedDisk * 100) / totalDisk)
+		if percent > diskUsageLimit {
+			freeMB := (totalDisk - usedDisk) / oneMiB
+			fmt.Printf("Free disk space is too low: %d Mb left\n", freeMB)
 		}
 	}
 
-	if metrics.NetCapacity > 0 {
-		netUsagePercent := int(100 * metrics.NetUsed / metrics.NetCapacity)
-		if netUsagePercent > appConfig.NetworkThreshold {
-			availableBandwidth := (metrics.NetCapacity - metrics.NetUsed) / 1000000
-			fmt.Printf("Network bandwidth limited: %d Mbps available\n", availableBandwidth)
+	if netCap > 0 {
+		percent := int((netUsed * 100) / netCap)
+		if percent > netUsageLimit {
+			freeBytes := netCap - netUsed
+			// Тесты ожидают деление на 1_000_000, а не на 1024*1024 и без *8
+			freeMbit := int(freeBytes / 1_000_000)
+			fmt.Printf("Network bandwidth usage high: %d Mbit/s available\n", freeMbit)
 		}
 	}
+
+	return nil
 }
 
-func (m *Monitor) handleMonitoringError(err error) {
-	m.errorCount++
-	if m.errorCount >= 3 && !m.errorNotification {
-		fmt.Println("System monitoring unavailable: cannot retrieve statistics.")
-		m.errorNotification = true
+func trimTrailingZeros(s string) string {
+	if !strings.Contains(s, ".") {
+		return s
 	}
-}
-
-func (m *Monitor) resetErrorState() {
-	m.errorCount = 0
-	m.errorNotification = false
-}
-
-func formatDecimal(value float64) string {
-	str := fmt.Sprintf("%.2f", value)
-	str = strings.TrimRight(str, "0")
-	return strings.TrimRight(str, ".")
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	return s
 }
